@@ -1,0 +1,321 @@
+#!/bin/bash
+
+#?
+#? figs - real admins use bash
+#?
+#? --- Usage -----------
+#? help    - shows this message
+#? remote  - run commands and scripts on remote systems 
+#?     -c  - command to run
+#?     -f  - files to run
+#?     -h  - hosts to run on
+#?     -hf - a file that lists hosts to run on
+
+
+#?
+#? --- Examples -----------
+#? figs help
+#? figs remote -h machine1 -c "ls -als"
+#? figs remote -h machine1 machine2 -f config_script1 config_script2
+#? figs remote -h machine1 machine2 -f config_script1 config_script2 -c "ps aux"
+#? figs remote -h machine1 machine2 -f config_script1 config_script2 -c "ps aux" "vmstat"
+#? figs remote -hf machinelistfile -c "ps aux"
+
+#?
+#? ---  UTILITY FUNCTIONS  -----------------
+#?
+
+contains(){
+    while read x;do
+        if [[ $x == *$1*  ]]; then return 0;fi;
+    done
+    return 1
+}
+
+
+spliton(){
+    IFS="$1"
+    read d
+    for x in $d;do
+        echo "$x"
+    done
+}
+
+
+#? concat - same as cat but also reads filenames from stdin
+concat(){
+    IFS=
+    for filename in "$@";do
+        while read line; do
+            echo "$line"
+        done < "$filename"
+    done    
+    
+    while read filename;do
+        while read line; do
+            echo "$line"
+        done < "$filename"
+    done
+}
+
+#? opts - extracts the arguments following the given flag
+opts(){
+    local key="$1"
+    shift
+    local current_flag="args"
+    local x
+    for x in "$@";do
+        if [[ $x == -* ]];then
+            current_flag=${x:1}
+        else
+            if [[ $current_flag == $key ]]; then
+                echo $x
+            fi
+        fi
+    done    
+}
+
+#? quote_it - quote every freaking argument
+quote_it(){
+    local pp=""
+    for p in "$@";do
+        pp="${pp} \"${p}\""
+        done
+    echo $pp
+}
+
+#? is_runnable - is this command in the path
+is_runnable() { [[ $(which "$1") ]];}
+
+#? is_running - is this process currently running
+is_running() { [[ "$(ps aux | grep $1 | grep -v grep)" ]]; }
+
+#? is_installed - is this package installed
+is_installed() { dpkg --get-selections | grep "$1" | cut -f 1 | contains $1;}
+
+#? is_user - does this user exist
+is_user() { [[ $(grep "$1:" /etc/passwd) ]];}
+
+# what installer to use
+if is_runnable apt-get; then
+    INSTALLER='apt-get'
+elif is_runnable yum; then
+    INSTALLER='yum'
+fi
+
+#?
+#? ---  PACKAGES  -----------------
+#?
+
+
+#? package_update - update the installer's packages
+package_update(){
+    [[  ! $package_update_guard == 1 ]] && { $INSTALLER update; package_update_guard=1; }
+}
+
+#? package_add - install this package
+package_add() { $INSTALLER -y install $1;}
+
+#? package_remove - remove this package
+package_remove() { $INSTALLER -y remove $1; $INSTALLER -y autoremove; }
+
+#? package_list - list installed packages
+package_list() { 
+    is_runnable dpkg && { dpkg --get-selections; return 0; }
+    is_runnable rpm  && { rpm -qa; return 0; }
+}
+
+
+#?
+#? ---  SERVICES  -----------------
+#?
+
+
+#?
+#? ---  USERS  -----------------
+#?
+
+#? user_remove - delete this user
+user_remove() { userdel --remove $1 ;}
+
+
+#? user_ssh_init - create ssh keys and authorized_keys file
+user_ssh_init()  {
+    local username=$1
+    su $username <<ENDSU
+    cd
+    if [[ ! -d .ssh ]]; then mkdir .ssh; fi
+    if [[ ! -e .ssh/id_rsa ]];then
+        ssh-keygen -f .ssh/id_rsa -t rsa -N ''
+    fi
+    if [[ ! -e .ssh/authorized_keys ]];then
+        touch .ssh/authorized_keys
+    fi
+    
+    chmod 700 .ssh
+    chmod 600 .ssh/authorized_keys
+    chmod 600 .ssh/id_rsa
+    chmod 622 .ssh/id_rsa.pub
+ENDSU
+}
+
+#? user_add - create this user
+user_add() {
+    if ! is_user "$1";then
+        local username="$1"
+        local userid=$(echo $username | md5sum)
+        userid=$((  60000 +  $((0x${userid:0:4}))  ))
+        groupadd -g $userid $username
+        useradd -m -u $userid -g $userid $username -s $(which bash)
+    fi
+    user_ssh_init $username
+}
+
+#? user_fix - correct the user id and group id of this user
+user_fix() {
+    local username=$1
+    local userid=$(echo $username | md5sum)
+    userid=$((  60000 +  $((0x${userid:0:4}))  ))
+    
+    if is_user;then
+        groupmod -g $userid $username
+        usermod -u $userid -g $userid $username
+        chgrp -R $username /home/$username 
+        chown -R $username /home/$username
+    fi
+    
+    user_ssh_init $username
+}
+
+#? user_allow_ssh_login - allow remote login to user by user@host
+user_allow_ssh_login() {
+    # $1 = user that allows remote login via ssh public key
+    # $2 = connect string to accout that you allow to log in
+   su $1 <<ENDSU
+    cd
+    ssh "$2" 'cat .ssh/id_rsa.pub' >>.ssh/authorized_keys
+ENDSU
+}
+
+
+#?
+#? ---  NETWORK  -----------------
+#?
+
+
+#? hostname_set - alter the hostname
+hostname_set() {
+    local orig=$(hostname)
+    if [[ ! $orig == "$1" ]]; then    
+        hostname $1
+        echo "$1" > /etc/hostname
+        sed -i "s/$orig/$1/g" /etc/hosts
+        ifdown --exclude=lo -a && ifup --exclude=lo -a
+        service network-manager restart
+    fi
+}
+
+
+#? ip_return 192.168.7.1 - what is my ip address with respect to the given machine
+get_ip() {
+    local h=($(ip route get "$1"))
+    echo ${h[5]} # get the fifth element, hahahaha
+}
+
+
+#?
+#? ---  FILES  -----------------
+#?
+
+#? file_cp - copy file to remote location
+file_cp(){
+    local src=$1
+    shift
+    local dest=$1
+    shift
+    local hosts=$@
+    local h
+    for h in $hosts;do
+        scp "$src" "figs@$h:$dest"
+    done  
+}
+
+#? file_includes - does the file include this string
+file_includes() { 
+    eval "grep -q '$1'  $2"
+    return $?
+}
+
+#?
+#? ---  figs  -----------------
+#?
+
+#? figs_install - prepare machine for use with figs
+figs_install() {
+    package_add ssh
+    user_add figs
+    usermod -a -G sudo figs
+    if [[ ! -e /etc/sudoers.d/figs ]] ;then
+        echo "figs	ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/figs
+    fi
+    chmod 440 /etc/sudoers.d/figs
+}
+
+#? figs_allow - allow user@host to configure this machine
+figs_allow() {
+    # $1 is the ssh connect string : erik@10.0.1.211
+    figs_install
+    user_allow_ssh_login figs $1
+}
+
+#? figs_remove - remove figs user
+figs_remove() {
+    user_remove figs
+    rm -f /etc/sudoers.d/figs
+}
+
+#? remote - execute command or scripts on remote machine
+remote(){
+    echo "Remote"
+    local hosts=$(opts hf "$@" | concat)$'\n'$(opts h "$@")
+    local commands=$(opts c "$@")
+    local files=$(opts f "$@")
+    
+    echo "    Hosts: "$hosts
+    echo "    Files: "$files
+    echo "    Commands: "$commands
+    echo
+    
+    local code=$(opts f "$@" | concat "${BASH_SOURCE[0]}")$'\n'$(opts c "$@")
+    
+    local h
+    for h in $hosts;do
+        echo "$h"
+        echo "$code" | ssh "figs@$h" "sudo bash -s"
+        echo
+    done 
+}
+
+help_filter(){
+    IFS=
+    local line
+    while read line; do
+        if [[ ${line:0:1} == '#' ]] && [[ ${line:1:1} == '?' ]];then
+            echo ${line:3}
+        fi    
+    done
+}
+
+#? help - show figs help
+help(){
+    opts s "$@" | concat "${BASH_SOURCE[0]}" | help_filter
+}
+
+if [[ "$#" -ge 1 ]]; then
+    eval $(quote_it "$@")
+fi
+
+#?
+#?
+#?
+
